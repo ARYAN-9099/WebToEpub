@@ -3,6 +3,7 @@
 /** Keep track of how to user tells us to parse different sites */
 class DefaultParserSiteSettings {
     constructor() {
+        this.communityConfigs = {};
         this.loadSiteConfigs();
     }
 
@@ -51,7 +52,75 @@ class DefaultParserSiteSettings {
     }
 
     getConfigForSite(hostname) {
-        return this.configs.get(hostname);
+        // User's own config takes priority over community configs
+        let userConfig = this.configs.get(hostname);
+        if (userConfig != null) {
+            return userConfig;
+        }
+        // Fall back to community configs
+        return this.getCommunityConfigForSite(hostname);
+    }
+
+    getCommunityConfigForSite(hostname) {
+        let config = this.communityConfigs[hostname];
+        if (config != null && DefaultParserSiteSettings.isConfigValid(config)) {
+            return config;
+        }
+        return null;
+    }
+
+    /** Load community configs from the bundled JSON file */
+    async loadCommunityConfigs() {
+        try {
+            let url = chrome.runtime.getURL("defaultParserCommunity.json");
+            let response = await fetch(url);
+            if (response.ok) {
+                let data = await response.json();
+                this.communityConfigs = data.configs || {};
+                this.communityConfigsLastUpdated = data.last_updated || 0;
+            }
+        } catch (err) {
+            // Bundled file missing or invalid — not fatal
+            console.log("Could not load bundled community configs:", err);
+        }
+    }
+
+    /** Fetch latest community configs from the remote server and merge */
+    async fetchLatestCommunityConfigs() {
+        let response = await fetch(DefaultParserSiteSettings.serverJsonUrl);
+        if (!response.ok) {
+            throw new Error("Failed to fetch community configs from server");
+        }
+        let serverData = await response.json();
+        let serverConfigs = serverData.configs || {};
+        let serverTimestamp = serverData.last_updated || 0;
+
+        // Only merge if server is newer
+        if (serverTimestamp >= this.communityConfigsLastUpdated) {
+            for (let hostname in serverConfigs) {
+                this.communityConfigs[hostname] = serverConfigs[hostname];
+            }
+            this.communityConfigsLastUpdated = serverTimestamp;
+        }
+        return Object.keys(serverConfigs).length;
+    }
+
+    /** Submit current config to the remote server */
+    async submitConfigToServer(hostname, contentCss, titleCss, removeCss) {
+        let formData = new URLSearchParams();
+        formData.append("hostname", hostname);
+        formData.append("contentCss", contentCss);
+        formData.append("titleCss", titleCss || "");
+        formData.append("removeCss", removeCss || "");
+
+        let response = await fetch(DefaultParserSiteSettings.serverPostUrl, {
+            method: "POST",
+            body: formData
+        });
+        if (!response.ok) {
+            throw new Error("Failed to submit config to server");
+        }
+        return await response.json();
     }
 
     constructFindContentLogicForSite(hostname) {
@@ -80,18 +149,54 @@ class DefaultParserSiteSettings {
     }
 }
 DefaultParserSiteSettings.storageName = "DefaultParserConfigs";
+// TODO: Update this URL to the actual server URL once finalized
+DefaultParserSiteSettings.serverJsonUrl = "http://webtoepub.devomin.de/defaultcss.json";
+DefaultParserSiteSettings.serverPostUrl = "http://webtoepub.devomin.de/save_css.php";
 
 /** Class that handles UI for configuring the Default Parser */
 class DefaultParserUI { // eslint-disable-line no-unused-vars
     constructor() {
     }
 
-    static setupDefaultParserUI(hostname, parser) {
+    static async setupDefaultParserUI(hostname, parser) {
+        // Load bundled community configs first
+        await parser.siteConfigs.loadCommunityConfigs();
+        
+        let statusEl = document.getElementById("communityConfigStatus");
+        statusEl.textContent = "";
+
+        // If the user doesn't have their own config for this site, try to auto-fetch the latest community one
+        let userConfig = parser.siteConfigs.configs.get(hostname);
+        if (userConfig == null) {
+            let localCommunityConfig = parser.siteConfigs.communityConfigs[hostname];
+            try {
+                statusEl.textContent = "Checking online for community config...";
+                await parser.siteConfigs.fetchLatestCommunityConfigs();
+                let onlineCommunityConfig = parser.siteConfigs.communityConfigs[hostname];
+                
+                if (onlineCommunityConfig != null) {
+                    statusEl.textContent = "Found community config for this site!";
+                } else {
+                    throw new Error("Not found online.");
+                }
+            } catch (err) {
+                // Online fetch failed or site not found online
+                if (localCommunityConfig != null) {
+                    // Restore local fallback if it existed
+                    parser.siteConfigs.communityConfigs[hostname] = localCommunityConfig;
+                    statusEl.textContent = "Using local offline community config.";
+                } else {
+                    statusEl.textContent = "Error: No community config found locally or online.";
+                }
+            }
+        }
+
         DefaultParserUI.copyInstructions();
         DefaultParserUI.setDefaultParserUiVisibility(true);
         DefaultParserUI.populateDefaultParserUI(hostname, parser);
         document.getElementById("testDefaultParserButton").onclick = DefaultParserUI.testDefaultParser.bind(null, parser);
         document.getElementById("finisheddefaultParserButton").onclick = DefaultParserUI.onFinishedClicked.bind(null, parser);
+        document.getElementById("submitConfigButton").onclick = DefaultParserUI.onSubmitConfig.bind(null, parser);
     }
 
     static onFinishedClicked(parser) {
@@ -120,9 +225,33 @@ class DefaultParserUI { // eslint-disable-line no-unused-vars
         let config = parser.siteConfigs.getConfigForSite(hostname);
         if (config != null) {
             DefaultParserUI.getContentCssInput().value = config.contentCss;
-            DefaultParserUI.getChapterTitleCssInput().value = config.titleCss;
-            DefaultParserUI.getUnwantedElementsCssInput().value = config.removeCss;
-            DefaultParserUI.getTestChapterUrlInput().value = config.testUrl;
+            DefaultParserUI.getChapterTitleCssInput().value = config.titleCss || "";
+            DefaultParserUI.getUnwantedElementsCssInput().value = config.removeCss || "";
+            DefaultParserUI.getTestChapterUrlInput().value = config.testUrl || "";
+        }
+    }
+
+
+
+    /** Submit the current config to the community server */
+    static async onSubmitConfig(parser) {
+        let statusEl = document.getElementById("communityConfigStatus");
+        let hostname = DefaultParserUI.getDefaultParserHostnameInput().value;
+        let contentCss = DefaultParserUI.getContentCssInput().value;
+        let titleCss = DefaultParserUI.getChapterTitleCssInput().value;
+        let removeCss = DefaultParserUI.getUnwantedElementsCssInput().value.trim();
+
+        if (util.isNullOrEmpty(hostname) || util.isNullOrEmpty(contentCss)) {
+            statusEl.textContent = "Hostname and Content CSS are required to submit.";
+            return;
+        }
+
+        try {
+            statusEl.textContent = "Submitting config...";
+            await parser.siteConfigs.submitConfigToServer(hostname, contentCss, titleCss, removeCss);
+            statusEl.textContent = `Config for "${hostname}" submitted successfully! Thank you!`;
+        } catch (err) {
+            statusEl.textContent = "Error submitting: " + err.message;
         }
     }
 
@@ -206,5 +335,61 @@ class DefaultParserUI { // eslint-disable-line no-unused-vars
     static getResultViewElement() {
         return document.getElementById("defaultParserVewResult");
     }
-}
 
+    /** Called after a successful EPUB pack when using DefaultParser.
+     *  Shows a one-time confirm dialog asking to share the config.
+     *  Tracks prompted hostnames in localStorage so it doesn't repeat. */
+    static async promptSubmitAfterPack(parser) {
+        let hostname = DefaultParserUI.getDefaultParserHostnameInput().value;
+        if (util.isNullOrEmpty(hostname)) {
+            return;
+        }
+
+        // Check if we already prompted for this hostname
+        let prompted = [];
+        try {
+            let raw = window.localStorage.getItem(DefaultParserUI.promptedStorageName);
+            if (raw != null) {
+                prompted = JSON.parse(raw);
+            }
+        } catch (e) {
+            // ignore parse errors
+        }
+        if (prompted.includes(hostname)) {
+            return;
+        }
+
+        // Mark as prompted regardless of their answer
+        prompted.push(hostname);
+        window.localStorage.setItem(DefaultParserUI.promptedStorageName, JSON.stringify(prompted));
+
+        // Only prompt if user actually has a non-default config
+        let config = parser.siteConfigs.getConfigForSite(hostname);
+        if (config == null || config.contentCss === "body") {
+            return;
+        }
+
+        let shouldSubmit = confirm(
+            "Your EPUB was packed successfully!\n\n" +
+            "Would you like to share your Default Parser CSS config for \"" + hostname + "\" " +
+            "with the community so others can use it too?"
+        );
+        if (shouldSubmit) {
+            try {
+                await parser.siteConfigs.submitConfigToServer(
+                    hostname, config.contentCss, config.titleCss || "", config.removeCss || ""
+                );
+                let statusEl = document.getElementById("communityConfigStatus");
+                if (statusEl) {
+                    statusEl.textContent = "Config for \"" + hostname + "\" submitted successfully! Thank you!";
+                }
+            } catch (err) {
+                let statusEl = document.getElementById("communityConfigStatus");
+                if (statusEl) {
+                    statusEl.textContent = "Error submitting: " + err.message;
+                }
+            }
+        }
+    }
+}
+DefaultParserUI.promptedStorageName = "DefaultParserSubmitPrompted";

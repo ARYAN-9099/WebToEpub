@@ -170,6 +170,10 @@ var main = (function() {
         } else {
             await Download.save(content, fileName, overwriteExisting, backgroundDownload);
         }
+        // After successful pack, prompt DefaultParser users to share their config
+        if (parser instanceof DefaultParser) {
+            await DefaultParserUI.promptSubmitAfterPack(parser);
+        }
         try {
             parser.updateReadingList();
             if (util.sleepController.signal.aborted) {
