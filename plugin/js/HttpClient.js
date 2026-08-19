@@ -273,19 +273,19 @@ class HttpClient {
             //set domain to the highest level from the website as all subdomains are included #1447 #1445
             let urlparts = parsedUrl.hostname.split(".");
             let cookies = "";
-            if (!util.isFirefox()) {
-                cookies = await chrome.cookies.getAll({domain: urlparts[urlparts.length-2]+"."+urlparts[urlparts.length-1],partitionKey: {}});
-            } else {
-                cookies = await browser.cookies.getAll({domain: urlparts[urlparts.length-2]+"."+urlparts[urlparts.length-1],partitionKey: {}});
-            }
+            let cookieApi = util.isFirefox() ? browser.cookies : chrome.cookies;
+            cookies = await cookieApi.getAll({domain: urlparts[urlparts.length-2]+"."+urlparts[urlparts.length-1],partitionKey: {}});
             cookies = cookies.filter(item => item.partitionKey != undefined);
             //create new cookies for the site without the partitionKey
             //cookies without the partitionKey get sent with fetch
-            cookies.forEach(element => chrome.cookies.set({
-                domain: element.domain,
-                url: "https://"+element.domain.substring(1),
-                name: element.name, 
-                value: element.value
+            await Promise.all(cookies.map(element => {
+                let cookieUrl = element.domain.startsWith(".") ? "https://" + element.domain.substring(1) : "https://" + element.domain;
+                return cookieApi.set({
+                    domain: element.domain,
+                    url: cookieUrl,
+                    name: element.name, 
+                    value: element.value
+                });
             }));
         } catch {
             // Probably running browser that doesn't support partitionKey, e.g. Kiwi
